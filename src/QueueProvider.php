@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Yiisoft\Queue\Redis;
 
+use InvalidArgumentException;
 use RedisException;
 use Yiisoft\Queue\Message\DelayEnvelope;
 use Yiisoft\Queue\Redis\Exception\NotConnectedRedisException;
@@ -26,12 +27,20 @@ class QueueProvider implements QueueProviderInterface
     private const DEFAULT_CHANNEL_NAME = 'yii-queue';
 
     /**
+     * @param int $reservationTimeout Seconds before an unacknowledged message can be reserved again.
+     *
+     * @throws InvalidArgumentException
      * @throws RedisException
      */
     public function __construct(
         private Redis $redis, //redis connection,
         private string $channelName = self::DEFAULT_CHANNEL_NAME,
-    ) {}
+        private int $reservationTimeout = 300,
+    ) {
+        if ($reservationTimeout < 1) {
+            throw new InvalidArgumentException('Reservation timeout must be a positive integer.');
+        }
+    }
 
     /**
      * @param array<string, array|bool|float|int|string|null> $meta
@@ -71,8 +80,7 @@ class QueueProvider implements QueueProviderInterface
     public function existInReserved(int $id): bool
     {
         $this->checkConnection();
-        $exist = $this->redis->hexists("$this->channelName.attempts", (string) $id);
-        return is_bool($exist) ? $exist : false;
+        return $this->redis->zscore("$this->channelName.reserved", (string) $id) !== false;
     }
 
     /**
@@ -104,7 +112,7 @@ class QueueProvider implements QueueProviderInterface
         if (!is_string($payload)) {
             return null;
         }
-        $this->redis->zRem("$this->channelName.reserved", time(), $id);
+        $this->redis->zadd("$this->channelName.reserved", time() + $this->reservationTimeout, $id);
         $this->redis->hincrby("$this->channelName.attempts", $id, 1);
         return new Reserve((int) $id, $payload);
     }
@@ -152,7 +160,7 @@ class QueueProvider implements QueueProviderInterface
             return $this;
         }
 
-        return new self($this->redis, $channelName);
+        return new self($this->redis, $channelName, $this->reservationTimeout);
     }
 
     public function getChannelName(): string

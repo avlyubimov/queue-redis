@@ -31,6 +31,27 @@ composer require yiisoft/queue-redis
 
 ## General usage
 
+### Reservation timeout
+
+Reserved messages that are not acknowledged with `delete()` become eligible for
+redelivery after 300 seconds by default. A subsequent `reserve()` call moves
+expired reservations back to the waiting list. This allows another consumer to
+process a message when its previous consumer exits before acknowledging it.
+
+Configure the timeout in seconds through `QueueProvider`:
+
+```php
+use Yiisoft\Queue\Redis\QueueProvider;
+
+// $redis is a connected ext-redis client.
+$provider = new QueueProvider($redis, 'emails', reservationTimeout: 600);
+```
+
+The reservation timeout must be positive and should exceed the longest expected
+message processing time. It is independent of the timeout passed to `reserve()`,
+which controls how long to wait for an available message. Handlers should be
+idempotent because a message may be delivered more than once.
+
 ## Testing
 
 ### Unit testing

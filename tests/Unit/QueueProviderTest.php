@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Yiisoft\Queue\Redis\Tests\Unit;
 
+use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
 use Yiisoft\Queue\Redis\Exception\NotConnectedRedisException;
 use Yiisoft\Queue\Redis\QueueProvider;
@@ -14,6 +15,45 @@ use RuntimeException;
 
 class QueueProviderTest extends TestCase
 {
+    /**
+     * @dataProvider invalidReservationTimeoutProvider
+     */
+    public function testReservationTimeoutMustBePositive(int $timeout): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Reservation timeout must be a positive integer.');
+
+        new QueueProvider($this->createMock(Redis::class), 'test', $timeout);
+    }
+
+    /** @return array<string, array{int}> */
+    public static function invalidReservationTimeoutProvider(): array
+    {
+        return ['zero' => [0], 'negative' => [-1]];
+    }
+
+    public function testChangingTheChannelPreservesTheReservationTimeout(): void
+    {
+        $redis = $this->createMock(Redis::class);
+        $redis->method('isConnected')->willReturn(true);
+        $redis->method('set')->willReturn(false);
+        $redis->method('brpop')->with('other.waiting', 1)->willReturn(['other.waiting', '1']);
+        $redis->method('hget')->with('other.messages', '1')->willReturn('payload');
+        $before = time();
+        $redis->expects(self::once())->method('zadd')->willReturnCallback(
+            static function (string $key, float|int $deadline, string $id) use ($before): int {
+                self::assertSame('other.reserved', $key);
+                self::assertSame('1', $id);
+                self::assertGreaterThanOrEqual($before + 42, $deadline);
+                self::assertLessThanOrEqual(time() + 42, $deadline);
+                return 1;
+            },
+        );
+        $provider = new QueueProvider($redis, 'test', 42);
+
+        self::assertNotNull($provider->withChannelName('other')->reserve(1));
+    }
+
     public function test__construct()
     {
         $redis = $this->createMock(Redis::class);
