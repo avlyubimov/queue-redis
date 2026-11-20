@@ -93,10 +93,7 @@ class QueueProviderTest extends TestCase
         $mock->method('isConnected')->willReturn(true);
         $mock->method('hget')->willReturn(null);
         $mock->method('incr')->willReturn(false);
-        $mock->method('zrevrangebyscore')->willReturn(['1', '2']);
-        $mock->method('zremrangebyscore')->willReturn(0);
-        $mock->method('set')->willReturn(true);
-        $mock->expects($this->exactly(8))->method('rpush')->willReturn(1);
+        $mock->method('set')->willReturn(false);
         $provider = new QueueProvider($mock);
         $this->assertNull($provider->reserve());
         $this->assertNull($provider->reserve());

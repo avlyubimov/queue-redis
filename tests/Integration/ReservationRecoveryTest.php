@@ -6,6 +6,7 @@ namespace Yiisoft\Queue\Redis\Tests\Integration;
 
 use PHPUnit\Framework\TestCase;
 use Redis;
+use RedisException;
 use Yiisoft\Queue\Redis\QueueProvider;
 
 use function bin2hex;
@@ -111,5 +112,109 @@ final class ReservationRecoveryTest extends TestCase
         self::assertFalse($this->provider->existInReserved($id));
         self::assertFalse($this->provider->existInWaiting($id));
         self::assertNull($this->provider->reserve(1));
+    }
+
+    public function testAConsumerThatDoesNotAcquireTheMoverLockCannotReleaseIt(): void
+    {
+        $lock = $this->channel . '.moving_lock';
+        $this->redis->set($lock, 'another-owner', ['EX' => 30]);
+
+        self::assertNull($this->provider->reserve(1));
+
+        self::assertSame('another-owner', $this->redis->get($lock));
+    }
+
+    public function testAnExpiredLockOwnerCannotReleaseItsSuccessorsLock(): void
+    {
+        $lock = $this->channel . '.moving_lock';
+        $redis = $this->createPartialMock(Redis::class, ['zrevrangebyscore']);
+        $redis->connect('redis');
+        $redis->method('zrevrangebyscore')->willReturnCallback(
+            function (string $key, string $max, string $min) use ($lock): array {
+                self::assertNotFalse($this->redis->get($lock));
+                // Simulate the first lock expiring and a second mover acquiring it.
+                $this->redis->set($lock, 'successor', ['EX' => 30]);
+                throw new RedisException('Interrupted expiry recovery.');
+            },
+        );
+        $provider = new QueueProvider($redis, $this->channel);
+
+        try {
+            $provider->reserve(1);
+            self::fail('Expiry recovery should have been interrupted.');
+        } catch (RedisException $exception) {
+            self::assertSame('Interrupted expiry recovery.', $exception->getMessage());
+        } finally {
+            $redis->close();
+        }
+
+        self::assertSame('successor', $this->redis->get($lock));
+    }
+
+    public function testTheMoverReleasesItsOwnLockAfterAnException(): void
+    {
+        $redis = $this->createPartialMock(Redis::class, ['zrevrangebyscore']);
+        $redis->connect('redis');
+        $redis->method('zrevrangebyscore')->willThrowException(new RedisException('Interrupted expiry recovery.'));
+
+        try {
+            (new QueueProvider($redis, $this->channel))->reserve(1);
+            self::fail('Expiry recovery should have been interrupted.');
+        } catch (RedisException $exception) {
+            self::assertSame('Interrupted expiry recovery.', $exception->getMessage());
+        } finally {
+            $redis->close();
+        }
+
+        self::assertFalse($this->redis->get($this->channel . '.moving_lock'));
+    }
+
+    /**
+     * @dataProvider expiredSetProvider
+     */
+    public function testAStaleMoverCannotRequeueAFreshReservation(string $suffix): void
+    {
+        $id = $this->provider->pushMessage('payload');
+        self::assertNotNull($this->provider->reserve(1));
+        $this->redis->zRem($this->channel . '.reserved', (string) $id);
+        $this->redis->zAdd($this->channel . '.' . $suffix, time() - 1, (string) $id);
+
+        $redis = $this->createPartialMock(Redis::class, ['zrevrangebyscore']);
+        $redis->connect('redis');
+        $interleaved = false;
+        $redis->method('zrevrangebyscore')->willReturnCallback(
+            function (string $key, string $max, string $min) use ($suffix, $id, &$interleaved): array {
+                $expired = $this->redis->zRevRangeByScore($key, $max, $min);
+                self::assertIsArray($expired);
+                if ($key === $this->channel . '.' . $suffix && !$interleaved) {
+                    $interleaved = true;
+                    self::assertSame([(string) $id], $expired);
+                    // Pause this mover after selection. Its lock expires, then another
+                    // consumer recovers the message and takes a fresh reservation.
+                    $this->redis->del($this->channel . '.moving_lock');
+                    $recovered = $this->provider->reserve(1);
+                    self::assertNotNull($recovered);
+                    self::assertSame($id, $recovered->id);
+                }
+                return $expired;
+            },
+        );
+
+        try {
+            self::assertNull((new QueueProvider($redis, $this->channel))->reserve(1));
+        } finally {
+            $redis->close();
+        }
+
+        self::assertTrue($interleaved);
+        self::assertTrue($this->provider->existInReserved($id));
+        self::assertSame('2', $this->redis->hGet($this->channel . '.attempts', (string) $id));
+        self::assertSame([], $this->redis->lRange($this->channel . '.waiting', 0, -1));
+    }
+
+    /** @return array<string, array{string}> */
+    public static function expiredSetProvider(): array
+    {
+        return ['reserved' => ['reserved'], 'delayed' => ['delayed']];
     }
 }

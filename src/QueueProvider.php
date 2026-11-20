@@ -11,11 +11,13 @@ use Yiisoft\Queue\Redis\Exception\NotConnectedRedisException;
 use Redis;
 use RuntimeException;
 
+use function bin2hex;
 use function is_array;
 use function is_bool;
 use function is_float;
 use function is_int;
 use function is_string;
+use function random_bytes;
 
 class QueueProvider implements QueueProviderInterface
 {
@@ -90,13 +92,24 @@ class QueueProvider implements QueueProviderInterface
     {
         $this->checkConnection();
         // Moves delayed and reserved jobs into waiting list with lock for one second
-        try {
-            if ($this->redis->set("$this->channelName.moving_lock", 'true', ['NX', 'EX', 1])) {
+        $lockKey = "$this->channelName.moving_lock";
+        $lockToken = bin2hex(random_bytes(16));
+        if ($this->redis->set($lockKey, $lockToken, ['NX', 'EX', 1])) {
+            try {
                 $this->moveExpired("$this->channelName.delayed");
                 $this->moveExpired("$this->channelName.reserved");
+            } finally {
+                $this->redis->eval(
+                    <<<'LUA'
+                    if redis.call('GET', KEYS[1]) == ARGV[1] then
+                        return redis.call('DEL', KEYS[1])
+                    end
+                    return 0
+                    LUA,
+                    [$lockKey, $lockToken],
+                    1,
+                );
             }
-        } finally {
-            $this->redis->del("$this->channelName.moving_lock");
         }
 
         $result = $this->redis->brpop("$this->channelName.waiting", $timeout);
@@ -176,10 +189,22 @@ class QueueProvider implements QueueProviderInterface
         $now = time();
         $expired = $this->redis->zrevrangebyscore($from, (string) $now, '-inf');
         if (is_array($expired)) {
-            $this->redis->zremrangebyscore($from, '-inf', (string) $now);
             /** @var string $id */
             foreach ($expired as $id) {
-                $this->redis->rpush("$this->channelName.waiting", $id);
+                // A concurrent mover may have already recovered and reserved this ID.
+                $this->redis->eval(
+                    <<<'LUA'
+                    local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+                    if score and tonumber(score) <= tonumber(ARGV[2]) then
+                        if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+                            return redis.call('RPUSH', KEYS[2], ARGV[1])
+                        end
+                    end
+                    return 0
+                    LUA,
+                    [$from, "$this->channelName.waiting", $id, $now],
+                    2,
+                );
             }
         }
     }
