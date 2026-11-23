@@ -39,13 +39,13 @@ class QueueProviderTest extends TestCase
         $redis->method('set')->willReturn(false);
         $redis->method('brpop')->with('other.waiting', 1)->willReturn(['other.waiting', '1']);
         $redis->method('hget')->with('other.messages', '1')->willReturn('payload');
-        $before = time();
+        $redis->method('hincrby')->willReturn(1);
+        $redis->method('time')->willReturn(['1234', '567890']);
         $redis->expects(self::once())->method('zadd')->willReturnCallback(
-            static function (string $key, float|int $deadline, string $id) use ($before): int {
+            static function (string $key, float|int $deadline, string $id): int {
                 self::assertSame('other.reserved', $key);
                 self::assertSame('1', $id);
-                self::assertGreaterThanOrEqual($before + 42, $deadline);
-                self::assertLessThanOrEqual(time() + 42, $deadline);
+                self::assertSame(1276.56789, $deadline);
                 return 1;
             },
         );

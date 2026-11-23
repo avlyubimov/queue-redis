@@ -10,6 +10,7 @@ use Yiisoft\Queue\Message\DelayEnvelope;
 use Yiisoft\Queue\Redis\Exception\NotConnectedRedisException;
 use Redis;
 use RuntimeException;
+use Throwable;
 
 use function bin2hex;
 use function is_array;
@@ -59,9 +60,9 @@ class QueueProvider implements QueueProviderInterface
         $delay = $meta[DelayEnvelope::META_DELAY_SECONDS] ?? 0;
         $delay = is_int($delay) || is_float($delay) ? $delay : 0;
         if ($delay > 0) {
-            $this->redis->zadd("$this->channelName.delayed", time() + $delay, $id);
+            $this->redis->zadd("$this->channelName.delayed", $this->getTime() + $delay, (string) $id);
         } else {
-            $this->redis->lpush("$this->channelName.waiting", $id);
+            $this->redis->lpush("$this->channelName.waiting", (string) $id);
         }
         return $id;
     }
@@ -95,20 +96,31 @@ class QueueProvider implements QueueProviderInterface
         $lockKey = "$this->channelName.moving_lock";
         $lockToken = bin2hex(random_bytes(16));
         if ($this->redis->set($lockKey, $lockToken, ['NX', 'EX', 1])) {
+            $failure = null;
             try {
                 $this->moveExpired("$this->channelName.delayed");
                 $this->moveExpired("$this->channelName.reserved");
+            } catch (Throwable $exception) {
+                $failure = $exception;
+                throw $exception;
             } finally {
-                $this->redis->eval(
-                    <<<'LUA'
-                    if redis.call('GET', KEYS[1]) == ARGV[1] then
-                        return redis.call('DEL', KEYS[1])
-                    end
-                    return 0
-                    LUA,
-                    [$lockKey, $lockToken],
-                    1,
-                );
+                try {
+                    $this->evaluate(
+                        <<<'LUA'
+                        if redis.call('GET', KEYS[1]) == ARGV[1] then
+                            return redis.call('DEL', KEYS[1])
+                        end
+                        return 0
+                        LUA,
+                        [$lockKey, $this->redis->_pack($lockToken)],
+                        1,
+                    );
+                } catch (Throwable $exception) {
+                    // Preserve the recovery error; the lock also has a one-second TTL.
+                    if ($failure === null) {
+                        throw $exception;
+                    }
+                }
             }
         }
 
@@ -117,16 +129,47 @@ class QueueProvider implements QueueProviderInterface
             return null;
         }
         $id = $result[1];
-        if (!is_string($id)) {
+        if (!is_string($id) && !is_int($id)) {
             return null;
         }
+        // Older producers may have serialized the ID as an integer.
+        $id = (string) $id;
 
         $payload = $this->redis->hget("$this->channelName.messages", $id);
         if (!is_string($payload)) {
             return null;
         }
-        $this->redis->zadd("$this->channelName.reserved", time() + $this->reservationTimeout, $id);
-        $this->redis->hincrby("$this->channelName.attempts", $id, 1);
+        try {
+            if ($this->redis->zadd("$this->channelName.reserved", $this->getTime() + $this->reservationTimeout, $id) === false) {
+                throw new RuntimeException('Unable to register the message reservation.');
+            }
+        } catch (Throwable $exception) {
+            try {
+                // A failed response may still mean ZADD succeeded. Leave an existing
+                // deadline for normal recovery; otherwise restore the popped ID.
+                $this->evaluate(
+                    <<<'LUA'
+                    local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+                    if not score then
+                        return redis.call('LPUSH', KEYS[2], ARGV[1])
+                    end
+                    return 0
+                    LUA,
+                    ["$this->channelName.reserved", "$this->channelName.waiting", $this->redis->_pack($id)],
+                    2,
+                );
+            } catch (Throwable $recoveryException) {
+                throw new RuntimeException(
+                    'Unable to restore the message after reservation failure: ' . $recoveryException->getMessage(),
+                    0,
+                    $exception,
+                );
+            }
+            throw $exception;
+        }
+        if ($this->redis->hincrby("$this->channelName.attempts", $id, 1) === false) {
+            throw new RuntimeException('Unable to record the reservation attempt.');
+        }
         return new Reserve((int) $id, $payload);
     }
 
@@ -186,27 +229,53 @@ class QueueProvider implements QueueProviderInterface
      */
     private function moveExpired(string $from): void
     {
-        $now = time();
+        $now = $this->getTime();
         $expired = $this->redis->zrevrangebyscore($from, (string) $now, '-inf');
-        if (is_array($expired)) {
-            /** @var string $id */
-            foreach ($expired as $id) {
-                // A concurrent mover may have already recovered and reserved this ID.
-                $this->redis->eval(
-                    <<<'LUA'
-                    local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
-                    if score and tonumber(score) <= tonumber(ARGV[2]) then
-                        if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
-                            return redis.call('RPUSH', KEYS[2], ARGV[1])
-                        end
-                    end
-                    return 0
-                    LUA,
-                    [$from, "$this->channelName.waiting", $id, $now],
-                    2,
-                );
-            }
+        if ($expired === false) {
+            throw new RuntimeException('Unable to read expired messages.');
         }
+        /** @var int|string $id */
+        foreach ($expired as $id) {
+            // A concurrent mover may have already recovered and reserved this ID.
+            $this->evaluate(
+                <<<'LUA'
+                local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+                if score and tonumber(score) <= tonumber(ARGV[2]) then
+                    if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+                        local result = redis.pcall('RPUSH', KEYS[2], ARGV[1])
+                        if type(result) == 'table' and result.err then
+                            redis.call('ZADD', KEYS[1], score, ARGV[1])
+                        end
+                        return result
+                    end
+                end
+                return 0
+                LUA,
+                [$from, "$this->channelName.waiting", $this->redis->_pack($id), $now],
+                2,
+            );
+        }
+    }
+
+    private function getTime(): float
+    {
+        $time = $this->redis->time();
+        if (!is_array($time) || !isset($time[0], $time[1])) {
+            throw new RuntimeException('Unable to read Redis server time.');
+        }
+
+        return (float) $time[0] + (float) $time[1] / 1_000_000;
+    }
+
+    /** @param list<float|int|string> $arguments */
+    private function evaluate(string $script, array $arguments, int $keyCount): int
+    {
+        $result = $this->redis->eval($script, $arguments, $keyCount);
+        if (!is_int($result)) {
+            throw new RuntimeException('Unable to execute the queue Lua script.');
+        }
+
+        return $result;
     }
 
     /**

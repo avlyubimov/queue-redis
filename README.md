@@ -52,6 +52,47 @@ message processing time. It is independent of the timeout passed to `reserve()`,
 which controls how long to wait for an available message. Handlers should be
 idempotent because a message may be delivered more than once.
 
+Deadlines and expiry checks use Redis `TIME`, including its microsecond component,
+so workers do not need synchronized local clocks and a one-second reservation is
+not rounded down to the start of the second. `TIME` is read outside Lua to retain
+compatibility with Redis 3.0.
+
+All producers and consumers of a channel must use the same PhpRedis prefix,
+serializer, and compression settings. These settings must round-trip string
+message IDs and payloads correctly in PhpRedis. Recovery and lock cleanup pack
+Lua arguments with the client's configured encoding, including compression.
+
+If reservation registration fails, `reserve()` throws instead of returning the
+message. It restores the popped ID to the waiting list when no reservation
+deadline exists; an already registered deadline is left for normal recovery.
+Restoration is best effort if the connection is unavailable. Popping and
+registering a reservation remain separate operations, so this does not eliminate
+the crash window between them. Lua failures are also reported as exceptions.
+If `RPUSH` fails during recovery, the Lua script attempts to restore the original
+sorted-set entry before reporting the error. If recovery and lock cleanup both fail, the recovery error is preserved
+and the lock expires after one second.
+
+### Redis command permissions
+
+Queue workers need `EVAL` and permission for every command called inside the Lua
+scripts, as well as the normal queue commands. For an ACL-managed Redis server,
+grant access only to the channel's keys (for example, `~emails.*`, including any
+configured PhpRedis key prefix) and the following commands:
+
+| Operation | Commands |
+| --- | --- |
+| Push messages | `INCR`, `HSET`, `LPUSH`, `ZADD`, `TIME` |
+| Reserve messages and count attempts | `BRPOP`, `HGET`, `ZADD`, `HINCRBY`, `TIME` |
+| Coordinate recovery and release locks | `SET` (with `NX` and `EX`), `EVAL`; Lua uses `GET`, `DEL`, `ZSCORE`, `ZREM`, `RPUSH`, `LPUSH`, `ZADD` |
+| Select expired entries | `ZREVRANGEBYSCORE` |
+| Check message status | `HEXISTS`, `ZSCORE` |
+| Acknowledge messages | `ZREM`, `HDEL` |
+| Read the last generated ID | `GET` |
+
+Connection setup may additionally require `AUTH`, `SELECT`, or `PING`, depending
+on the application's Redis connection configuration. Recovery does not require
+`KEYS`, `SCAN`, `SCRIPT LOAD`, or administrative commands.
+
 ## Testing
 
 ### Unit testing

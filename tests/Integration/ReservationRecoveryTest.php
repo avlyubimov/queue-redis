@@ -7,12 +7,15 @@ namespace Yiisoft\Queue\Redis\Tests\Integration;
 use PHPUnit\Framework\TestCase;
 use Redis;
 use RedisException;
+use RuntimeException;
+use Yiisoft\Queue\Message\DelayEnvelope;
 use Yiisoft\Queue\Redis\QueueProvider;
 
 use function bin2hex;
 use function random_bytes;
 use function sleep;
-use function time;
+use function constant;
+use function defined;
 
 final class ReservationRecoveryTest extends TestCase
 {
@@ -41,7 +44,7 @@ final class ReservationRecoveryTest extends TestCase
     public function testReserveRecordsAnExpirationDeadline(): void
     {
         $id = $this->provider->pushMessage('payload');
-        $before = time();
+        $before = $this->serverTime();
 
         $message = $this->provider->reserve(1);
 
@@ -50,7 +53,7 @@ final class ReservationRecoveryTest extends TestCase
         $deadline = $this->redis->zScore($this->channel . '.reserved', (string) $id);
         self::assertNotFalse($deadline);
         self::assertGreaterThanOrEqual($before + 30, $deadline);
-        self::assertLessThanOrEqual(time() + 30, $deadline);
+        self::assertLessThanOrEqual($this->serverTime() + 30, $deadline);
     }
 
     public function testUnacknowledgedMessageIsRecoveredAfterTheConsumerDisconnects(): void
@@ -90,7 +93,7 @@ final class ReservationRecoveryTest extends TestCase
         $secondId = $this->provider->pushMessage('second');
         self::assertNotNull($this->provider->reserve(1));
         self::assertNotNull($this->provider->reserve(1));
-        $expired = time() - 1;
+        $expired = $this->serverTime() - 1;
         $this->redis->zAdd($this->channel . '.reserved', $expired, (string) $firstId, $expired, (string) $secondId);
 
         $recovered = $this->provider->reserve(1);
@@ -177,7 +180,7 @@ final class ReservationRecoveryTest extends TestCase
         $id = $this->provider->pushMessage('payload');
         self::assertNotNull($this->provider->reserve(1));
         $this->redis->zRem($this->channel . '.reserved', (string) $id);
-        $this->redis->zAdd($this->channel . '.' . $suffix, time() - 1, (string) $id);
+        $this->redis->zAdd($this->channel . '.' . $suffix, $this->serverTime() - 1, (string) $id);
 
         $redis = $this->createPartialMock(Redis::class, ['zrevrangebyscore']);
         $redis->connect('redis');
@@ -216,5 +219,277 @@ final class ReservationRecoveryTest extends TestCase
     public static function expiredSetProvider(): array
     {
         return ['reserved' => ['reserved'], 'delayed' => ['delayed']];
+    }
+
+    /** @dataProvider encodingProvider */
+    public function testRecoveryPreservesClientValueEncoding(int $serializer, int $compression): void
+    {
+        $this->redis->setOption(Redis::OPT_PREFIX, 'prefixed:');
+        $this->redis->setOption(Redis::OPT_SERIALIZER, $serializer);
+        $this->redis->setOption(Redis::OPT_COMPRESSION, $compression);
+
+        foreach ([false, true] as $delayed) {
+            $meta = $delayed ? [DelayEnvelope::META_DELAY_SECONDS => 30] : [];
+            $id = $this->provider->pushMessage('payload', $meta);
+            if ($delayed) {
+                $this->redis->zAdd($this->channel . '.delayed', 0, (string) $id);
+            }
+
+            $first = $this->provider->reserve(1);
+            self::assertNotNull($first);
+            self::assertSame($id, $first->id);
+            self::assertSame('payload', $first->payload);
+            self::assertFalse($this->redis->get($this->channel . '.moving_lock'));
+            self::assertTrue($this->provider->existInReserved($id));
+
+            $this->redis->zAdd($this->channel . '.reserved', 0, (string) $id);
+            $recovered = $this->provider->reserve(1);
+            self::assertNotNull($recovered);
+            self::assertSame($id, $recovered->id);
+            self::assertSame('payload', $recovered->payload);
+            self::assertFalse($this->redis->get($this->channel . '.moving_lock'));
+            self::assertSame(2, (int) $this->redis->hGet($this->channel . '.attempts', (string) $id));
+            $this->provider->delete((string) $id);
+            self::assertFalse($this->provider->existInReserved($id));
+        }
+    }
+
+    /** @return iterable<string, array{int, int}> */
+    public static function encodingProvider(): iterable
+    {
+        foreach (['SERIALIZER_NONE', 'SERIALIZER_PHP', 'SERIALIZER_JSON', 'SERIALIZER_IGBINARY', 'SERIALIZER_MSGPACK'] as $serializerName) {
+            if (!defined(Redis::class . '::' . $serializerName)) {
+                continue;
+            }
+            $serializer = constant(Redis::class . '::' . $serializerName);
+            foreach (['COMPRESSION_NONE', 'COMPRESSION_LZF', 'COMPRESSION_LZ4', 'COMPRESSION_ZSTD'] as $compressionName) {
+                if (!defined(Redis::class . '::' . $compressionName)) {
+                    continue;
+                }
+                $compression = constant(Redis::class . '::' . $compressionName);
+                if ($serializer === Redis::SERIALIZER_JSON && $compression !== Redis::COMPRESSION_NONE) {
+                    // PhpRedis 6.3.0 itself does not round-trip JSON scalar IDs with compression.
+                    continue;
+                }
+                yield "$serializerName/$compressionName" => [$serializer, $compression];
+            }
+        }
+    }
+
+    public function testMessagesWithIntegerEncodedIdsCanStillBeRecovered(): void
+    {
+        $this->redis->setOption(Redis::OPT_SERIALIZER, Redis::SERIALIZER_PHP);
+        $id = $this->provider->pushMessage('payload');
+        $this->redis->del($this->channel . '.waiting');
+        $this->redis->zAdd($this->channel . '.delayed', 0, $id);
+
+        $message = $this->provider->reserve(1);
+
+        self::assertNotNull($message);
+        self::assertSame($id, $message->id);
+        self::assertSame('payload', $message->payload);
+        self::assertTrue($this->provider->existInReserved($id));
+        $this->provider->delete((string) $id);
+        self::assertFalse($this->provider->existInReserved($id));
+    }
+
+    public function testAOneSecondReservationIsNotRoundedDown(): void
+    {
+        $provider = new QueueProvider($this->redis, $this->channel, 1);
+        $id = $provider->pushMessage('payload');
+        $before = $this->serverTime();
+        self::assertNotNull($provider->reserve(1));
+        $deadline = $this->redis->zScore($this->channel . '.reserved', (string) $id);
+        self::assertNotFalse($deadline);
+        self::assertGreaterThanOrEqual($before + 1, $deadline);
+        self::assertLessThanOrEqual($this->serverTime() + 1, $deadline);
+    }
+
+    public function testDeadlinesUseRedisTimeRatherThanTheWorkersClock(): void
+    {
+        $redis = $this->createPartialMock(Redis::class, ['time']);
+        $redis->connect('redis');
+        $redis->method('time')->willReturn(['1234', '567890']);
+        $provider = new QueueProvider($redis, $this->channel, 1);
+        try {
+            $id = $provider->pushMessage('delayed', [DelayEnvelope::META_DELAY_SECONDS => 1]);
+            self::assertSame(1235.56789, $this->redis->zScore($this->channel . '.delayed', (string) $id));
+            $this->redis->zAdd($this->channel . '.delayed', 1234.56789, (string) $id);
+            self::assertNotNull($provider->reserve(1));
+            self::assertSame(1235.56789, $this->redis->zScore($this->channel . '.reserved', (string) $id));
+            self::assertNull($provider->reserve(1));
+        } finally {
+            $redis->close();
+        }
+    }
+
+    /** @dataProvider registrationFailureProvider */
+    public function testRegistrationFailureDoesNotDeliverOrLoseTheMessage(bool $throw, bool $registered): void
+    {
+        $id = $this->provider->pushMessage('payload');
+        $redis = $this->createPartialMock(Redis::class, ['zadd']);
+        $redis->connect('redis');
+        $redis->method('zadd')->willReturnCallback(
+            function (string $key, float $deadline, string $member) use ($throw, $registered): bool {
+                if ($registered) {
+                    $this->redis->zAdd($key, $deadline, $member);
+                }
+                if ($throw) {
+                    throw new RedisException('Registration failed.');
+                }
+                return false;
+            },
+        );
+        try {
+            (new QueueProvider($redis, $this->channel))->reserve(1);
+            self::fail('A failed registration must not return a message.');
+        } catch (RedisException|RuntimeException $exception) {
+            self::assertSame($throw ? 'Registration failed.' : 'Unable to register the message reservation.', $exception->getMessage());
+        } finally {
+            $redis->close();
+        }
+        self::assertSame($registered, $this->provider->existInReserved($id));
+        self::assertSame($registered ? [] : [(string) $id], $this->redis->lRange($this->channel . '.waiting', 0, -1));
+        self::assertFalse($this->redis->hGet($this->channel . '.attempts', (string) $id));
+    }
+
+    /** @return array<string, array{bool, bool}> */
+    public static function registrationFailureProvider(): array
+    {
+        return [
+            'false' => [false, false],
+            'exception' => [true, false],
+            'false after write' => [false, true],
+            'exception after write' => [true, true],
+        ];
+    }
+
+    public function testAZeroZaddReplyIsASuccessfulReservation(): void
+    {
+        $id = $this->provider->pushMessage('payload');
+        // Updating an existing member returns zero, not a Redis error.
+        $this->redis->zAdd($this->channel . '.reserved', $this->serverTime() + 30, (string) $id);
+
+        self::assertNotNull($this->provider->reserve(1));
+        self::assertTrue($this->provider->existInReserved($id));
+    }
+
+    public function testFailedRequeuePreservesTheExpiredEntry(): void
+    {
+        $id = $this->provider->pushMessage('payload');
+        self::assertNotNull($this->provider->reserve(1));
+        $this->redis->zAdd($this->channel . '.reserved', 0, (string) $id);
+        $this->redis->set($this->channel . '.waiting', 'wrong-type');
+
+        try {
+            $this->provider->reserve(1);
+            self::fail('A failed Lua command must be reported.');
+        } catch (RedisException|RuntimeException) {
+            self::assertSame(0.0, $this->redis->zScore($this->channel . '.reserved', (string) $id));
+            self::assertSame('payload', $this->redis->hGet($this->channel . '.messages', (string) $id));
+            self::assertFalse($this->redis->get($this->channel . '.moving_lock'));
+        }
+    }
+
+    public function testAFailedLuaReplyIsNotTreatedAsASuccessfulRecovery(): void
+    {
+        $id = $this->provider->pushMessage('payload');
+        self::assertNotNull($this->provider->reserve(1));
+        $this->redis->zAdd($this->channel . '.reserved', 0, (string) $id);
+        $redis = $this->createPartialMock(Redis::class, ['eval', 'brpop']);
+        $redis->connect('redis');
+        $redis->method('eval')->willReturn(false);
+        $redis->expects(self::never())->method('brpop');
+        try {
+            (new QueueProvider($redis, $this->channel))->reserve(1);
+            self::fail('A failed Lua reply must be reported.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('Unable to execute the queue Lua script.', $exception->getMessage());
+        } finally {
+            $redis->close();
+        }
+        self::assertSame(0.0, $this->redis->zScore($this->channel . '.reserved', (string) $id));
+    }
+
+    public function testAFailedLockCleanupIsReportedBeforePoppingAMessage(): void
+    {
+        $id = $this->provider->pushMessage('payload');
+        $redis = $this->createPartialMock(Redis::class, ['eval', 'brpop']);
+        $redis->connect('redis');
+        $redis->method('eval')->willReturn(false);
+        $redis->expects(self::never())->method('brpop');
+        try {
+            (new QueueProvider($redis, $this->channel))->reserve(1);
+            self::fail('A failed lock cleanup must be reported.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('Unable to execute the queue Lua script.', $exception->getMessage());
+        } finally {
+            $redis->close();
+        }
+        self::assertSame([(string) $id], $this->redis->lRange($this->channel . '.waiting', 0, -1));
+    }
+
+    public function testCleanupFailureDoesNotReplaceTheRecoveryException(): void
+    {
+        $redis = $this->createPartialMock(Redis::class, ['eval', 'zrevrangebyscore']);
+        $redis->connect('redis');
+        $redis->method('eval')->willReturn(false);
+        $redis->method('zrevrangebyscore')->willThrowException(new RedisException('Original recovery failure.'));
+        try {
+            (new QueueProvider($redis, $this->channel))->reserve(1);
+            self::fail('The original recovery error must be reported.');
+        } catch (RedisException $exception) {
+            self::assertSame('Original recovery failure.', $exception->getMessage());
+        } finally {
+            $redis->close();
+        }
+    }
+
+    public function testServerTimeFailureAfterPopRestoresTheMessage(): void
+    {
+        $id = $this->provider->pushMessage('payload');
+        $this->redis->set($this->channel . '.moving_lock', 'another-owner', ['EX' => 30]);
+        $redis = $this->createPartialMock(Redis::class, ['time']);
+        $redis->connect('redis');
+        $redis->method('time')->willThrowException(new RedisException('Server TIME failed.'));
+        try {
+            (new QueueProvider($redis, $this->channel))->reserve(1);
+            self::fail('A failed TIME command must be reported.');
+        } catch (RedisException $exception) {
+            self::assertSame('Server TIME failed.', $exception->getMessage());
+        } finally {
+            $redis->close();
+        }
+        self::assertSame([(string) $id], $this->redis->lRange($this->channel . '.waiting', 0, -1));
+        self::assertFalse($this->provider->existInReserved($id));
+    }
+
+    public function testFailedRestorationKeepsTheRegistrationErrorAsItsCause(): void
+    {
+        $this->provider->pushMessage('payload');
+        $redis = $this->createPartialMock(Redis::class, ['zadd', 'eval']);
+        $redis->connect('redis');
+        $redis->method('zadd')->willReturn(false);
+        $redis->method('eval')->willReturnCallback(
+            fn(string $script, array $arguments, int $keyCount): int|false => $keyCount === 2
+                ? false
+                : $this->redis->eval($script, $arguments, $keyCount),
+        );
+        try {
+            (new QueueProvider($redis, $this->channel))->reserve(1);
+            self::fail('A failed restoration must be reported.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('Unable to restore the message after reservation failure: Unable to execute the queue Lua script.', $exception->getMessage());
+            self::assertSame('Unable to register the message reservation.', $exception->getPrevious()?->getMessage());
+        } finally {
+            $redis->close();
+        }
+    }
+
+    private function serverTime(): float
+    {
+        $time = $this->redis->time();
+        self::assertIsArray($time);
+        return (float) $time[0] + (float) $time[1] / 1_000_000;
     }
 }
